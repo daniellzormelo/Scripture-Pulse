@@ -1,7 +1,7 @@
-import { DetectionResponse, ActiveContext } from '../types/scripture';
-import { normalizeBookName } from '../data/bibleDatabase';
+import { DetectionResponse, ActiveContext, BiblePassageText } from '../types/scripture';
+import { normalizeBookName, getBiblePassageText } from '../data/bibleDatabase';
 
-// Standard 66 Bible books list
+// Standard 66 Bible books list with single chapter books tagged
 const BIBLE_BOOKS = [
   "Genesis", "Exodus", "Leviticus", "Numbers", "Deuteronomy",
   "Joshua", "Judges", "Ruth", "1 Samuel", "2 Samuel", "1 Kings", "2 Kings",
@@ -16,6 +16,9 @@ const BIBLE_BOOKS = [
   "Titus", "Philemon", "Hebrews", "James", "1 Peter", "2 Peter",
   "1 John", "2 John", "3 John", "Jude", "Revelation"
 ];
+
+// Single chapter books where "Jude 24" or "Obadiah 4" means Chapter 1 Verse 24
+const SINGLE_CHAPTER_BOOKS = ["Obadiah", "Philemon", "2 John", "3 John", "Jude"];
 
 const NUMBER_MAP: Record<string, number> = {
   'one': 1, 'first': 1, '1st': 1, '1': 1,
@@ -33,7 +36,7 @@ const NUMBER_MAP: Record<string, number> = {
   'twenty one': 21, 'twenty-one': 21, 'twenty 1': 21,
   'twenty two': 22, 'twenty-two': 22, 'twenty 2': 22,
   'twenty three': 23, 'twenty-three': 23, 'twenty 3': 23,
-  'twenty four': 24, 'twenty-four': 24,
+  'twenty four': 24, 'twenty-four': 24, 'twenty 4': 24,
   'twenty five': 25, 'twenty-five': 25,
   'twenty six': 26, 'twenty-six': 26,
   'twenty seven': 27, 'twenty-seven': 27,
@@ -56,7 +59,25 @@ function parseNumber(str: string): number | null {
 }
 
 /**
- * Perform fast deterministic scripture reference detection
+ * False-positive ambiguous guard
+ * Disqualifies conversational phrases like:
+ * "when I was 16, John told me"
+ * "in chapter 3 of my book"
+ */
+function isAmbiguousFalsePositive(text: string): boolean {
+  const lower = text.toLowerCase();
+  // Conversation patterns
+  if (/\b(when i was|years old|told me|spoke with me|friend of mine)\b/i.test(lower)) {
+    return true;
+  }
+  if (/\b(my book|this book|my life)\b/i.test(lower) && !/\bbible|scripture|word of god\b/i.test(lower)) {
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Engine 1: Instant deterministic local pattern and citation parser (<5ms, zero API cost)
  */
 export function parseScriptureLocally(
   text: string,
@@ -67,10 +88,61 @@ export function parseScriptureLocally(
   }
 
   const rawSpoken = text.trim();
+  if (rawSpoken.length < 3) return { detected: false };
+
+  // Guard against conversational false positives
+  if (isAmbiguousFalsePositive(rawSpoken)) {
+    return { detected: false };
+  }
+
   const lower = rawSpoken.toLowerCase();
 
-  // Pattern 1: Explicit Book + Chapter + Verse (e.g. "John chapter 3 verse 16", "Romans 8:28", "First John 4 verse 7")
-  // Clean prefixes like "turn with me to", "open your bibles to"
+  // Pattern 0: Single-chapter shortcuts (e.g., "Jude 24", "Jude verse 24", "Philemon 4")
+  for (const singleBook of SINGLE_CHAPTER_BOOKS) {
+    const singlePattern = new RegExp(`\\b${singleBook}\\s*(?:verse|v\\.)?\\s*(\\d+|[a-z\\s]+?)(?:\\s*(?:to|through|until|-)\\s*(\\d+|[a-z\\s]+?))?\\b`, 'i');
+    const sMatch = lower.match(singlePattern);
+    if (sMatch) {
+      const vStart = parseNumber(sMatch[1]) || parseInt(sMatch[1], 10);
+      const vEnd = sMatch[2] ? (parseNumber(sMatch[2]) || parseInt(sMatch[2], 10)) : vStart;
+      if (vStart && !isNaN(vStart) && vStart > 0) {
+        return {
+          detected: true,
+          book: singleBook,
+          chapter: 1,
+          verse_start: vStart,
+          verse_end: vEnd && !isNaN(vEnd) ? vEnd : vStart,
+          confidence: 0.99,
+          raw_spoken_phrase: rawSpoken,
+          engine: 'regex'
+        };
+      }
+    }
+  }
+
+  // Pattern 1: Standard Scripture Notation (e.g., "John 3:16", "Romans 8:28-31", "1 Cor 13:4-7", "Ps 23:1-4")
+  const colonMatch = lower.match(/\b([1-3]?\s*[a-z]+)\s*(\d+)\s*:\s*(\d+)(?:\s*(?:-|to|through)\s*(\d+))?\b/i);
+  if (colonMatch) {
+    const rawBookStr = colonMatch[1].trim();
+    const chapterNum = parseInt(colonMatch[2], 10);
+    const vStart = parseInt(colonMatch[3], 10);
+    const vEnd = colonMatch[4] ? parseInt(colonMatch[4], 10) : vStart;
+
+    const norm = normalizeBookName(rawBookStr);
+    if (chapterNum > 0 && vStart > 0) {
+      return {
+        detected: true,
+        book: norm,
+        chapter: chapterNum,
+        verse_start: vStart,
+        verse_end: vEnd,
+        confidence: 0.99,
+        raw_spoken_phrase: rawSpoken,
+        engine: 'regex'
+      };
+    }
+  }
+
+  // Pattern 2: Explicit Spoken Scripture (e.g., "John chapter 3 verse 16", "First Corinthians thirteen verse 4")
   for (const book of BIBLE_BOOKS) {
     const bookRegexPattern = book
       .replace('1 ', '(1|1st|first|one)\\s*')
@@ -79,55 +151,37 @@ export function parseScriptureLocally(
       .replace('Psalms', '(psalms?|psa)')
       .replace('Psalm', '(psalms?|psa)');
 
-    // Full match regex: Book + Chapter + Verse (optional range)
-    const fullPattern = new RegExp(
+    // Regex matching "Book + [chapter] X + [verse] Y"
+    const spokenPattern = new RegExp(
       `\\b${bookRegexPattern}\\s*(?:chapter)?\\s*(\\d+|[a-z\\s]+?)\\s*(?:verse|v\\.|verses)?\\s*(\\d+|[a-z\\s]+?)(?:\\s*(?:to|through|until|-)\\s*(\\d+|[a-z\\s]+?))?\\b`,
       'i'
     );
 
-    const match = lower.match(fullPattern);
+    const match = lower.match(spokenPattern);
     if (match) {
-      const rawBookMatched = book;
       const chapterVal = parseNumber(match[2]) || parseInt(match[2], 10);
       const verseStartVal = parseNumber(match[3]) || parseInt(match[3], 10);
       const verseEndVal = match[4] ? (parseNumber(match[4]) || parseInt(match[4], 10)) : verseStartVal;
 
-      if (chapterVal && verseStartVal && !isNaN(chapterVal) && !isNaN(verseStartVal)) {
+      if (chapterVal && verseStartVal && !isNaN(chapterVal) && !isNaN(verseStartVal) && chapterVal > 0 && verseStartVal > 0) {
         return {
           detected: true,
-          book: normalizeBookName(rawBookMatched),
+          book: normalizeBookName(book),
           chapter: chapterVal,
           verse_start: verseStartVal,
           verse_end: verseEndVal && !isNaN(verseEndVal) ? verseEndVal : verseStartVal,
           confidence: 0.98,
-          raw_spoken_phrase: rawSpoken
+          raw_spoken_phrase: rawSpoken,
+          engine: 'regex'
         };
       }
     }
   }
 
-  // Pattern 2: Standard Notation like "John 3:16", "Rom 8:28-30", "1 Cor 13:4-7"
-  const colonMatch = lower.match(/\b([1-3]?\s*[a-z]+)\s*(\d+)\s*:\s*(\d+)(?:\s*-\s*(\d+))?\b/i);
-  if (colonMatch) {
-    const bookStr = colonMatch[1];
-    const chapterNum = parseInt(colonMatch[2], 10);
-    const vStart = parseInt(colonMatch[3], 10);
-    const vEnd = colonMatch[4] ? parseInt(colonMatch[4], 10) : vStart;
-
-    return {
-      detected: true,
-      book: normalizeBookName(bookStr),
-      chapter: chapterNum,
-      verse_start: vStart,
-      verse_end: vEnd,
-      confidence: 0.99,
-      raw_spoken_phrase: rawSpoken
-    };
-  }
-
-  // Pattern 3: Relative Reference Resolution (e.g. "now look at verse 18", "skip to verse 20", "verses 28 to 30")
+  // Pattern 3: Relative Reference Resolution (Context-Carry)
+  // When pastor says: "Now look at verse 18", "skip to verse 20", "read verses 28 through 30"
   if (context && context.book && context.chapter) {
-    const relativeMatch = lower.match(/\b(?:look at|jump to|skip to|turn to|now|read)?\s*verses?\s*(\d+|[a-z\s]+?)(?:\s*(?:to|through|until|-)\s*(\d+|[a-z\s]+?))?\b/i);
+    const relativeMatch = lower.match(/\b(?:look at|jump to|skip to|turn to|now|read|and)?\s*verses?\s*(\d+|[a-z\\s]+?)(?:\s*(?:to|through|until|-)\s*(\d+|[a-z\\s]+?))?\b/i);
     if (relativeMatch) {
       const vStart = parseNumber(relativeMatch[1]) || parseInt(relativeMatch[1], 10);
       const vEnd = relativeMatch[2] ? (parseNumber(relativeMatch[2]) || parseInt(relativeMatch[2], 10)) : vStart;
@@ -139,8 +193,9 @@ export function parseScriptureLocally(
           chapter: context.chapter,
           verse_start: vStart,
           verse_end: vEnd && !isNaN(vEnd) ? vEnd : vStart,
-          confidence: 0.95,
-          raw_spoken_phrase: rawSpoken
+          confidence: 0.96,
+          raw_spoken_phrase: rawSpoken,
+          engine: 'regex'
         };
       }
     }

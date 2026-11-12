@@ -1,365 +1,507 @@
-import React, { useState, useEffect } from 'react';
-import { Navbar } from './components/Navbar';
-import { ActiveContextBanner } from './components/ActiveContextBanner';
-import { LiveSpeechInput } from './components/LiveSpeechInput';
-import { VerseDetectionCard } from './components/VerseDetectionCard';
-import { LowerThirdDisplay } from './components/LowerThirdDisplay';
-import { JsonOutputConsole } from './components/JsonOutputConsole';
-import { ParseLogHistory } from './components/ParseLogHistory';
-import { DetectionResponse, ActiveContext, ParseLogEntry, BiblePassageText } from './types/scripture';
-import { getBiblePassageText } from './data/bibleDatabase';
-import { Radio, Monitor, Code, Sparkles, BookOpen, Layers, Volume2 } from 'lucide-react';
+import React, { useState, useEffect, useRef } from 'react';
+import {
+  BiblePassageText,
+  BibleTranslation,
+  DetectionQueueItem,
+  LiveOutputContent,
+  TranscriptSnippet,
+  CustomSlide
+} from './types/scripture';
+import { liveSync } from './services/liveSyncService';
+import { parsePreacherVoiceCommand, stepPassageVerse } from './services/voiceCommandService';
+import { runThreeEnginePipeline } from './services/threeEnginePipeline';
+import { getBiblePassageText, ALL_TRANSLATIONS } from './data/bibleDatabase';
+import { getPublicAppUrl } from './utils/urlUtils';
 
+import { StudioTopBar } from './components/StudioTopBar';
+import { SermonTranscriptColumn } from './components/SermonTranscriptColumn';
+import { DetectionQueueColumn } from './components/DetectionQueueColumn';
+import { QuickSearchPinnedColumn } from './components/QuickSearchPinnedColumn';
+import { LivePreviewColumn } from './components/LivePreviewColumn';
+import { ProjectorOutput } from './components/ProjectorOutput';
+import { LowerThirdOverlay } from './components/LowerThirdOverlay';
+import { WorshipStudio } from './components/WorshipStudio';
 import { SoftwareIntegrationsHub } from './components/SoftwareIntegrationsHub';
-import { parseScriptureLocally } from './services/localRegexParser';
 
-import { ObsStandaloneOverlay } from './components/ObsStandaloneOverlay';
+import { Radio, Music, Tv, BookOpen } from 'lucide-react';
 
 export default function App() {
-  const [activeTab, setActiveTab] = useState<'parser' | 'projection' | 'integrations' | 'api'>('parser');
-  const [isDarkMode, setIsDarkMode] = useState<boolean>(true);
-  const [currentContext, setCurrentContext] = useState<ActiveContext>({ book: null, chapter: null });
-  const [latestDetection, setLatestDetection] = useState<DetectionResponse | null>(null);
-  const [passageForProjection, setPassageForProjection] = useState<BiblePassageText | null>(null);
-  const [logs, setLogs] = useState<ParseLogEntry[]>([]);
-  const [isLoading, setIsLoading] = useState<boolean>(false);
-  const [lastLatencyMs, setLastLatencyMs] = useState<number>(18);
-  const [lastSpokenText, setLastSpokenText] = useState<string>('');
+  // 1. Dual-Window URL Query Routing (?view=projector or ?view=lower-third or ?displayMode=obs-transparent)
+  const isProjectorView = typeof window !== 'undefined' && new URLSearchParams(window.location.search).get('view') === 'projector';
+  const isLowerThirdView = typeof window !== 'undefined' && (
+    new URLSearchParams(window.location.search).get('view') === 'lower-third' ||
+    new URLSearchParams(window.location.search).get('displayMode') === 'obs-transparent' ||
+    new URLSearchParams(window.location.search).get('displayMode') === 'overlay'
+  );
 
-  // Detect OBS Browser Source Overlay URL mode
-  const isObsOverlay = typeof window !== 'undefined' && 
-    (new URLSearchParams(window.location.search).get('displayMode') === 'obs-transparent' || 
-     new URLSearchParams(window.location.search).get('displayMode') === 'overlay');
-
-  // Sync dark mode class on <html> element
-  useEffect(() => {
-    if (isDarkMode) {
-      document.documentElement.classList.add('dark');
-    } else {
-      document.documentElement.classList.remove('dark');
-    }
-  }, [isDarkMode]);
-
-  if (isObsOverlay) {
-    return <ObsStandaloneOverlay />;
+  if (isProjectorView) {
+    return <ProjectorOutput />;
   }
 
-  // Helper to sync detected passage across localStorage, window events, and Express server feed
-  const broadcastVerseFeed = (data: DetectionResponse, text: string) => {
-    if (!data.detected) return;
+  if (isLowerThirdView) {
+    return <LowerThirdOverlay />;
+  }
 
-    const passage = getBiblePassageText(data.book, data.chapter, data.verse_start, data.verse_end);
-    setPassageForProjection(passage);
-    return passage;
+  // 2. Main Operator Studio State
+  const [activeTab, setActiveTab] = useState<'scripture' | 'worship' | 'software'>('scripture');
+  const [isMicActive, setIsMicActive] = useState<boolean>(true);
+  const [sttStatus, setSttStatus] = useState<'connected' | 'listening' | 'idle' | 'error'>('listening');
+  const [audioLevel, setAudioLevel] = useState<number>(35);
+  const [autoPushEnabled, setAutoPushEnabled] = useState<boolean>(false);
+  const [activeTranslation, setActiveTranslation] = useState<BibleTranslation>('NIV');
+
+  // Active Context & Live Broadcast
+  const [currentContext, setCurrentContext] = useState<{ book: string | null; chapter: number | null }>({ book: 'John', chapter: 3 });
+  const [liveOutput, setLiveOutput] = useState<LiveOutputContent>(liveSync.getInitialContent());
+
+  // Queues & Transcripts
+  const [transcriptSnippets, setTranscriptSnippets] = useState<TranscriptSnippet[]>([
+    { id: 'ts-1', text: 'Welcome church, turn with me to John chapter 3 verse 16.', timestamp: '10:02 AM', isFinal: true, detectedRef: 'John 3:16' }
+  ]);
+  const [interimTranscript, setInterimTranscript] = useState<string>('');
+  const [queueItems, setQueueItems] = useState<DetectionQueueItem[]>([
+    {
+      id: 'q-1',
+      timestamp: '10:02 AM',
+      reference: 'John 3:16',
+      book: 'John',
+      chapter: 3,
+      verse_start: 16,
+      verse_end: 16,
+      confidence: 0.98,
+      raw_spoken_phrase: 'John chapter 3 verse 16',
+      engine: 'regex',
+      passage: getBiblePassageText('John', 3, 16, 16, 'NIV'),
+      tier: 'high-confidence',
+      isPinned: true
+    }
+  ]);
+  const [pinnedPassages, setPinnedPassages] = useState<BiblePassageText[]>([
+    getBiblePassageText('John', 3, 16, 16, 'NIV')
+  ]);
+
+  const [copiedObsUrl, setCopiedObsUrl] = useState(false);
+
+  // Web Speech API refs
+  const recognitionRef = useRef<any>(null);
+  const lastParsedTextRef = useRef<string>('');
+
+  // Synchronize Live Output with BroadcastChannel & Server
+  const handlePushLiveContent = (content: LiveOutputContent) => {
+    setLiveOutput(content);
+    liveSync.publish(content);
+
+    if (content.type === 'scripture') {
+      setCurrentContext({
+        book: content.passage.book,
+        chapter: content.passage.chapter
+      });
+    }
   };
 
-  // Automatically sync & broadcast passageForProjection whenever updated in the app
-  useEffect(() => {
-    if (!passageForProjection) return;
+  const handlePushLivePassage = (passage: BiblePassageText) => {
+    handlePushLiveContent({ type: 'scripture', passage });
+  };
 
-    const feedPayload = {
-      detected: true,
-      book: passageForProjection.book,
-      chapter: passageForProjection.chapter,
-      verse_start: passageForProjection.verse_start,
-      verse_end: passageForProjection.verse_end,
-      reference: passageForProjection.reference,
-      translation: passageForProjection.translation,
-      text: passageForProjection.fullText,
-      fullText: passageForProjection.fullText,
-      raw_spoken_phrase: `${passageForProjection.reference} (${passageForProjection.translation})`,
-      timestamp: new Date().toISOString()
+  // Keyboard Navigation Shortcuts
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      // Don't intercept when user is typing in an input or textarea
+      if (['INPUT', 'TEXTAREA'].includes((e.target as HTMLElement)?.tagName)) {
+        return;
+      }
+
+      if (e.key === 'ArrowRight' || e.key === 'ArrowDown') {
+        e.preventDefault();
+        if (liveOutput.type === 'scripture') {
+          const next = stepPassageVerse(liveOutput.passage, 'next', activeTranslation);
+          handlePushLivePassage(next);
+        }
+      } else if (e.key === 'ArrowLeft' || e.key === 'ArrowUp') {
+        e.preventDefault();
+        if (liveOutput.type === 'scripture') {
+          const prev = stepPassageVerse(liveOutput.passage, 'prev', activeTranslation);
+          handlePushLivePassage(prev);
+        }
+      } else if (e.key === 'Escape') {
+        e.preventDefault();
+        handlePushLiveContent({ type: 'hold' });
+      }
     };
 
-    // 1. Instant local window event for same-page overlay components (0ms)
-    window.dispatchEvent(new CustomEvent('scripture-updated', { detail: feedPayload }));
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [liveOutput, activeTranslation]);
 
-    // 2. Instant localStorage event for cross-tab OBS/EasyWorship overlays (< 1ms)
-    try {
-      localStorage.setItem('active_verse_feed', JSON.stringify(feedPayload));
-    } catch (e) {}
+  // Three-Engine Detection and Voice Command Evaluation
+  const processSpokenSpeech = async (spokenText: string) => {
+    if (!spokenText.trim() || spokenText.trim() === lastParsedTextRef.current) return;
+    lastParsedTextRef.current = spokenText.trim();
 
-    // 3. Post to backend server feed for external OBS / EasyWorship / vMix pollers
-    fetch('/api/easyworship-feed', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(feedPayload)
-    }).catch(() => {});
-  }, [passageForProjection]);
+    // 1. Hands-Free Preacher Voice Commands (Active ONLY when a verse is currently live)
+    const isVerseLive = liveOutput.type === 'scripture';
+    const voiceCmd = parsePreacherVoiceCommand(spokenText, isVerseLive);
 
-  // Main API Parsing Handler with Zero-Latency Instant Local Parsing
-  const handleParseText = async (
-    text: string,
-    source: 'live_mic' | 'typed' | 'preset' | 'audio_upload' = 'typed'
-  ) => {
-    if (!text.trim()) return;
-
-    setLastSpokenText(text);
-    const startTime = Date.now();
-
-    // STEP 1: Synchronous Zero-Latency Local Deterministic Detection (< 2ms)
-    const localResult = parseScriptureLocally(text, currentContext.book ? currentContext : undefined);
-    const localLatency = Date.now() - startTime;
-
-    if (localResult.detected) {
-      setLastLatencyMs(localLatency);
-      setLatestDetection(localResult);
-
-      let resolvedFromContext = false;
-      if (currentContext.book && currentContext.chapter && localResult.book === currentContext.book && localResult.chapter === currentContext.chapter && !text.toLowerCase().includes(currentContext.book.toLowerCase())) {
-        resolvedFromContext = true;
-      }
-
-      setCurrentContext({
-        book: localResult.book,
-        chapter: localResult.chapter,
-        lastUpdated: Date.now()
-      });
-
-      broadcastVerseFeed(localResult, text);
-
-      const newEntry: ParseLogEntry = {
-        id: Math.random().toString(36).substring(2, 9),
-        timestamp: new Date().toLocaleTimeString(),
-        input_text: text,
-        response: localResult,
-        latency_ms: localLatency,
-        resolved_from_context: resolvedFromContext,
-        source
-      };
-      setLogs(prev => [newEntry, ...prev]);
+    if (voiceCmd.type === 'CLEAR_SCREEN') {
+      handlePushLiveContent({ type: 'hold' });
+      return;
+    } else if (voiceCmd.type === 'NEXT_VERSE' && liveOutput.type === 'scripture') {
+      const nextPassage = stepPassageVerse(liveOutput.passage, 'next', activeTranslation);
+      handlePushLivePassage(nextPassage);
+      return;
+    } else if (voiceCmd.type === 'PREV_VERSE' && liveOutput.type === 'scripture') {
+      const prevPassage = stepPassageVerse(liveOutput.passage, 'prev', activeTranslation);
+      handlePushLivePassage(prevPassage);
+      return;
+    } else if (voiceCmd.type === 'CHANGE_TRANSLATION' && liveOutput.type === 'scripture') {
+      setActiveTranslation(voiceCmd.translation);
+      const switched = getBiblePassageText(
+        liveOutput.passage.book,
+        liveOutput.passage.chapter,
+        liveOutput.passage.verse_start,
+        liveOutput.passage.verse_end,
+        voiceCmd.translation
+      );
+      handlePushLivePassage(switched);
+      return;
     }
 
-    // STEP 2: Asynchronous Gemini API Call (Background confirmation/refinement)
-    setIsLoading(true);
-    try {
-      const response = await fetch('/api/parse-speech', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          text,
-          current_context: currentContext.book ? currentContext : undefined
-        })
+    // 2. Run Three-Engine Cascading Scripture Detection Pipeline
+    const detection = await runThreeEnginePipeline(
+      spokenText,
+      currentContext,
+      activeTranslation,
+      navigator.onLine
+    );
+
+    if (detection && detection.detected && detection.passage) {
+      const newItem: DetectionQueueItem = {
+        id: `queue-${Date.now()}`,
+        timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+        reference: detection.passage.reference,
+        book: detection.passage.book,
+        chapter: detection.passage.chapter,
+        verse_start: detection.passage.verse_start,
+        verse_end: detection.passage.verse_end,
+        confidence: detection.confidence,
+        raw_spoken_phrase: detection.raw_spoken_phrase || spokenText,
+        engine: detection.engine,
+        passage: detection.passage,
+        tier: detection.tier
+      };
+
+      // Auto-Push Rule: If Auto-Push is ON and high-confidence, automatically broadcast live
+      if (autoPushEnabled && detection.tier === 'high-confidence') {
+        handlePushLivePassage(detection.passage);
+      }
+
+      setQueueItems(prev => [newItem, ...prev.slice(0, 15)]);
+
+      // Tag detected reference into sermon transcript log
+      setTranscriptSnippets(prev => {
+        if (prev.length > 0) {
+          const last = prev[prev.length - 1];
+          return [...prev.slice(0, -1), { ...last, detectedRef: detection.passage!.reference }];
+        }
+        return prev;
       });
+    }
+  };
 
-      const contentType = response.headers.get('content-type');
-      if (response.ok && contentType && contentType.includes('application/json')) {
-        const serverData: DetectionResponse = await response.json();
-        const serverLatency = Date.now() - startTime;
+  // Web Speech API Continuous Audio Listener
+  useEffect(() => {
+    const SpeechRecognition = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
+    if (!SpeechRecognition) {
+      setSttStatus('error');
+      return;
+    }
 
-        if (serverData.detected) {
-          setLastLatencyMs(serverLatency);
-          setLatestDetection(serverData);
+    const recognition = new SpeechRecognition();
+    recognition.continuous = true;
+    recognition.interimResults = true;
+    recognition.lang = 'en-US';
 
-          let resolvedFromContext = false;
-          if (currentContext.book && currentContext.chapter && serverData.book === currentContext.book && serverData.chapter === currentContext.chapter && !text.toLowerCase().includes(currentContext.book.toLowerCase())) {
-            resolvedFromContext = true;
-          }
+    recognition.onresult = (event: any) => {
+      let currentTranscript = '';
+      let finalSentence = '';
 
-          setCurrentContext({
-            book: serverData.book,
-            chapter: serverData.chapter,
-            lastUpdated: Date.now()
-          });
-
-          broadcastVerseFeed(serverData, text);
-
-          // Update log entry if not already added by local parser
-          if (!localResult.detected) {
-            const newEntry: ParseLogEntry = {
-              id: Math.random().toString(36).substring(2, 9),
-              timestamp: new Date().toLocaleTimeString(),
-              input_text: text,
-              response: serverData,
-              latency_ms: serverLatency,
-              resolved_from_context: resolvedFromContext,
-              source
-            };
-            setLogs(prev => [newEntry, ...prev]);
-          }
-        } else if (!localResult.detected) {
-          setLatestDetection({ detected: false });
+      for (let i = event.resultIndex; i < event.results.length; i++) {
+        const result = event.results[i];
+        const text = result[0].transcript;
+        if (result.isFinal) {
+          finalSentence += text;
+          // Add to permanent sermon notes
+          setTranscriptSnippets(prev => [
+            ...prev,
+            {
+              id: `ts-${Date.now()}-${Math.random()}`,
+              text: text.trim(),
+              timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+              isFinal: true
+            }
+          ]);
+          processSpokenSpeech(text);
+        } else {
+          currentTranscript += text;
         }
       }
-    } catch (err) {
-      console.warn('Background Gemini API check skipped/failed:', err);
-    } finally {
-      setIsLoading(false);
+
+      setInterimTranscript(currentTranscript);
+      if (currentTranscript.trim()) {
+        // Fast interim parsing for instant sub-500ms voice detection
+        processSpokenSpeech(currentTranscript);
+        setAudioLevel(Math.min(95, 30 + currentTranscript.length * 2));
+      } else {
+        setAudioLevel(20);
+      }
+    };
+
+    recognition.onerror = () => {
+      setSttStatus('idle');
+    };
+
+    recognition.onend = () => {
+      if (isMicActive) {
+        try {
+          recognition.start();
+          setSttStatus('listening');
+        } catch (e) {}
+      } else {
+        setSttStatus('idle');
+      }
+    };
+
+    recognitionRef.current = recognition;
+
+    if (isMicActive) {
+      try {
+        recognition.start();
+        setSttStatus('listening');
+      } catch (e) {}
+    }
+
+    // Auto-pulse simulated VU meter
+    const vuInterval = setInterval(() => {
+      if (isMicActive) {
+        setAudioLevel(prev => (prev > 40 ? prev - 8 : 25 + Math.random() * 20));
+      }
+    }, 180);
+
+    return () => {
+      try { recognition.stop(); } catch (e) {}
+      clearInterval(vuInterval);
+    };
+  }, [isMicActive, currentContext, activeTranslation, autoPushEnabled, liveOutput]);
+
+  const handleToggleMic = () => {
+    if (isMicActive) {
+      try { recognitionRef.current?.stop(); } catch (e) {}
+      setIsMicActive(false);
+      setSttStatus('idle');
+      setAudioLevel(0);
+    } else {
+      setIsMicActive(true);
+      try {
+        recognitionRef.current?.start();
+        setSttStatus('listening');
+      } catch (e) {}
     }
   };
 
-  const handleClearContext = () => {
-    setCurrentContext({ book: null, chapter: null });
+  const handleLaunchProjector = () => {
+    window.open(`${window.location.origin}?view=projector`, 'ScripturePulse_Projector', 'width=1280,height=720,menubar=no,toolbar=no');
   };
 
-  const handleSetContext = (book: string, chapter: number) => {
-    setCurrentContext({ book, chapter, lastUpdated: Date.now() });
+  const handleCopyObsUrl = () => {
+    const publicUrl = getPublicAppUrl();
+    const obsUrl = `${publicUrl}?view=lower-third&theme=gold-sacred&bg=transparent`;
+    navigator.clipboard.writeText(obsUrl);
+    setCopiedObsUrl(true);
+    setTimeout(() => setCopiedObsUrl(false), 2500);
   };
 
-  const handleClearLogs = () => {
-    setLogs([]);
-  };
+  const handleExportStudyNotes = () => {
+    let content = `# SERMON STUDY NOTES & SCRIPTURE TRANSCRIPT\nDate: ${new Date().toLocaleDateString()}\n\n`;
+    content += `## DETECTED SCRIPTURE REFERENCES\n`;
+    queueItems.forEach(q => {
+      content += `- **${q.reference} (${q.passage.translation})**: "${q.passage.fullText}"\n`;
+    });
+    content += `\n## FULL SERMON TRANSCRIPT\n`;
+    transcriptSnippets.forEach(t => {
+      content += `[${t.timestamp}] ${t.text} ${t.detectedRef ? `[${t.detectedRef}]` : ''}\n`;
+    });
 
-  const handleSelectLog = (log: ParseLogEntry) => {
-    setLatestDetection(log.response);
-    setLastSpokenText(log.input_text);
-    if (log.response.detected) {
-      const passage = getBiblePassageText(
-        log.response.book,
-        log.response.chapter,
-        log.response.verse_start,
-        log.response.verse_end
-      );
-      setPassageForProjection(passage);
-    }
+    const blob = new Blob([content], { type: 'text/markdown' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `Sermon_Notes_${new Date().toISOString().slice(0, 10)}.md`;
+    a.click();
+    URL.revokeObjectURL(url);
   };
 
   return (
-    <div className="min-h-screen bg-slate-50 dark:bg-slate-950 text-slate-900 dark:text-slate-100 transition-colors flex flex-col">
+    <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col font-sans select-none overflow-hidden">
       
-      {/* Top Bar Contract Navbar */}
-      <Navbar
-        activeTab={activeTab}
-        setActiveTab={setActiveTab}
-        isDarkMode={isDarkMode}
-        setIsDarkMode={setIsDarkMode}
-        onOpenProjectionOverlay={() => setActiveTab('projection')}
-        hasActiveContext={Boolean(currentContext.book)}
-        currentBook={currentContext.book}
-        currentChapter={currentContext.chapter}
+      {/* 1. Scripture Live Studio Top Status Bar */}
+      <StudioTopBar
+        isMicActive={isMicActive}
+        onToggleMic={handleToggleMic}
+        sttStatus={sttStatus}
+        autoPushEnabled={autoPushEnabled}
+        onToggleAutoPush={() => setAutoPushEnabled(prev => !prev)}
+        activeTranslation={activeTranslation}
+        onSelectTranslation={(trans) => {
+          setActiveTranslation(trans);
+          if (liveOutput.type === 'scripture') {
+            const switched = getBiblePassageText(
+              liveOutput.passage.book,
+              liveOutput.passage.chapter,
+              liveOutput.passage.verse_start,
+              liveOutput.passage.verse_end,
+              trans
+            );
+            handlePushLivePassage(switched);
+          }
+        }}
+        onLaunchProjector={handleLaunchProjector}
+        onCopyObsUrl={handleCopyObsUrl}
+        copiedObsUrl={copiedObsUrl}
+        audioLevel={audioLevel}
+        currentContextBook={currentContext.book}
+        currentContextChapter={currentContext.chapter}
       />
 
-      <main className="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 lg:px-8 py-8 space-y-6">
+      {/* Mode Navigation Tabs (Scripture Studio | Worship Lyrics | Software Hub) */}
+      <div className="bg-slate-900 border-b border-slate-800 px-4 py-1.5 flex items-center justify-between">
+        <div className="flex items-center gap-1.5">
+          <button
+            onClick={() => setActiveTab('scripture')}
+            className={`px-3 py-1.5 rounded-xl text-xs font-bold transition-all flex items-center gap-2 ${
+              activeTab === 'scripture'
+                ? 'bg-amber-500 text-slate-950 shadow-sm'
+                : 'text-slate-400 hover:text-white'
+            }`}
+          >
+            <BookOpen className="w-3.5 h-3.5" />
+            <span>Scripture Studio</span>
+          </button>
+
+          <button
+            onClick={() => setActiveTab('worship')}
+            className={`px-3 py-1.5 rounded-xl text-xs font-bold transition-all flex items-center gap-2 ${
+              activeTab === 'worship'
+                ? 'bg-indigo-600 text-white shadow-sm'
+                : 'text-slate-400 hover:text-white'
+            }`}
+          >
+            <Music className="w-3.5 h-3.5" />
+            <span>Worship Lyrics</span>
+          </button>
+
+          <button
+            onClick={() => setActiveTab('software')}
+            className={`px-3 py-1.5 rounded-xl text-xs font-bold transition-all flex items-center gap-2 ${
+              activeTab === 'software'
+                ? 'bg-purple-600 text-white shadow-sm'
+                : 'text-slate-400 hover:text-white'
+            }`}
+          >
+            <Tv className="w-3.5 h-3.5" />
+            <span>OBS / vMix / EW Hub</span>
+          </button>
+        </div>
+
+        <div className="text-[11px] font-mono text-slate-500 hidden md:block">
+          Keyboard: <span className="text-slate-300">Arrows (Next/Prev)</span> · <span className="text-slate-300">Esc (Clear)</span>
+        </div>
+      </div>
+
+      {/* 2. Resizable Multi-Column Operator Studio UI */}
+      <main className="flex-1 p-3 overflow-hidden">
         
-        {/* Relative Reference Resolution Context Banner */}
-        <ActiveContextBanner
-          context={currentContext}
-          onClearContext={handleClearContext}
-          onSetContext={handleSetContext}
-        />
-
-        {/* Tab 1: Parser Console (Default Minimalist View) */}
-        {activeTab === 'parser' && (
-          <div className="space-y-6">
-            <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
-              
-              {/* Left Column: Live Audio Speech Listener */}
-              <div className="lg:col-span-5 space-y-6">
-                <LiveSpeechInput
-                  onParseText={handleParseText}
-                  isLoading={isLoading}
-                />
-              </div>
-
-              {/* Right Column: Prominent Scripture Detection View */}
-              <div className="lg:col-span-7 space-y-6">
-                <VerseDetectionCard
-                  detection={latestDetection}
-                  onSendToProjection={(passage) => {
-                    setPassageForProjection(passage);
-                    setActiveTab('projection');
-                  }}
-                />
-              </div>
-
+        {activeTab === 'scripture' && (
+          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-3 h-[calc(100vh-105px)]">
+            
+            {/* Column 1: Live Sermon Transcript with Study Notes Export */}
+            <div className="h-full overflow-hidden">
+              <SermonTranscriptColumn
+                transcriptSnippets={transcriptSnippets}
+                interimTranscript={interimTranscript}
+                onExportStudyNotes={handleExportStudyNotes}
+                onClearTranscript={() => setTranscriptSnippets([])}
+              />
             </div>
 
-            {/* Collapsible Inspection Drawer for Logs & JSON Terminal */}
-            <details className="group bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-2xl shadow-sm overflow-hidden">
-              <summary className="p-4 flex items-center justify-between cursor-pointer font-semibold text-xs text-slate-700 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-800/50 transition-colors select-none">
-                <span className="flex items-center gap-2">
-                  <span className="w-2 h-2 rounded-full bg-amber-500"></span>
-                  <span>Developer Inspection & Transcript Log ({logs.length})</span>
-                </span>
-                <span className="text-[11px] text-slate-400 font-mono group-open:rotate-180 transition-transform">
-                  ▼ Click to Expand
-                </span>
-              </summary>
+            {/* Column 2: Two-Tier AI Detection Queue */}
+            <div className="h-full overflow-hidden">
+              <DetectionQueueColumn
+                queueItems={queueItems}
+                onPushLive={handlePushLivePassage}
+                onDismissItem={(id) => setQueueItems(prev => prev.filter(i => i.id !== id))}
+                onTogglePin={(id) => setQueueItems(prev => prev.map(i => i.id === id ? { ...i, isPinned: !i.isPinned } : i))}
+                activePassageReference={liveOutput.type === 'scripture' ? liveOutput.passage.reference : undefined}
+              />
+            </div>
 
-              <div className="p-5 border-t border-slate-100 dark:border-slate-800 grid grid-cols-1 lg:grid-cols-2 gap-6">
-                <ParseLogHistory
-                  logs={logs}
-                  onClearLogs={handleClearLogs}
-                  onSelectLog={handleSelectLog}
-                />
-                <JsonOutputConsole
-                  detection={latestDetection}
-                  lastSpokenPhrase={lastSpokenText}
-                  latencyMs={lastLatencyMs}
-                />
-              </div>
-            </details>
+            {/* Column 3: Quick Search, Pinned Rail & Custom Slides */}
+            <div className="h-full overflow-hidden">
+              <QuickSearchPinnedColumn
+                onPushLive={handlePushLivePassage}
+                onPushCustomSlide={(slide) => handlePushLiveContent({ type: 'custom', title: slide.title, content: slide.content })}
+                pinnedPassages={pinnedPassages}
+                onRemovePinned={(ref) => setPinnedPassages(prev => prev.filter(p => p.reference !== ref))}
+                currentTranslation={activeTranslation}
+              />
+            </div>
+
+            {/* Column 4: Live Preview Monitor & Chapter Navigator */}
+            <div className="h-full overflow-hidden">
+              <LivePreviewColumn
+                currentContent={liveOutput}
+                onClearScreen={() => handlePushLiveContent({ type: 'hold' })}
+                onNavigateVerse={(direction) => {
+                  if (liveOutput.type === 'scripture') {
+                    const step = stepPassageVerse(liveOutput.passage, direction, activeTranslation);
+                    handlePushLivePassage(step);
+                  }
+                }}
+                onJumpToVerse={(vNum) => {
+                  if (liveOutput.type === 'scripture') {
+                    const jump = getBiblePassageText(liveOutput.passage.book, liveOutput.passage.chapter, vNum, vNum, activeTranslation);
+                    handlePushLivePassage(jump);
+                  } else {
+                    const jump = getBiblePassageText(currentContext.book || 'John', currentContext.chapter || 3, vNum, vNum, activeTranslation);
+                    handlePushLivePassage(jump);
+                  }
+                }}
+                onLaunchProjector={handleLaunchProjector}
+              />
+            </div>
+
           </div>
         )}
 
-
-
-        {/* Tab 3: Projection Broadcast System */}
-        {activeTab === 'projection' && (
-          <div className="space-y-6">
-            <LowerThirdDisplay
-              passage={passageForProjection}
-              onClearDisplay={() => setPassageForProjection(null)}
+        {/* Worship Lyrics Mini-Studio */}
+        {activeTab === 'worship' && (
+          <div className="h-[calc(100vh-105px)] overflow-y-auto">
+            <WorshipStudio
+              onPushSlide={handlePushLiveContent}
+              activeSlideId={null}
             />
-
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-              <VerseDetectionCard
-                detection={latestDetection}
-                onSendToProjection={(passage) => setPassageForProjection(passage)}
-              />
-              <JsonOutputConsole
-                detection={latestDetection}
-                lastSpokenPhrase={lastSpokenText}
-                latencyMs={lastLatencyMs}
-              />
-            </div>
           </div>
         )}
 
-        {/* Tab 3: Church Software Integrations (EasyWorship, OBS, vMix) */}
-        {activeTab === 'integrations' && (
-          <SoftwareIntegrationsHub currentPassage={passageForProjection} />
-        )}
-
-        {/* Tab 4: JSON & API Specifications */}
-        {activeTab === 'api' && (
-          <div className="space-y-6">
-            <JsonOutputConsole
-              detection={latestDetection}
-              lastSpokenPhrase={lastSpokenText}
-              latencyMs={lastLatencyMs}
+        {/* Software Integrations Hub (OBS / EasyWorship / vMix) */}
+        {activeTab === 'software' && (
+          <div className="h-[calc(100vh-105px)] overflow-y-auto">
+            <SoftwareIntegrationsHub
+              currentPassage={liveOutput.type === 'scripture' ? liveOutput.passage : null}
             />
-
-            <div className="bg-white dark:bg-slate-900 border border-slate-200 dark:border-slate-800 rounded-2xl p-6">
-              <h3 className="text-base font-bold text-slate-900 dark:text-white mb-3">
-                API Output Rules & Schema Specifications
-              </h3>
-              <ul className="space-y-2 text-xs text-slate-600 dark:text-slate-300">
-                <li className="flex items-center gap-2">
-                  <span className="w-1.5 h-1.5 rounded-full bg-amber-500"></span>
-                  <span><strong>Output format:</strong> Returns strictly valid raw JSON without markdown formatting, code blocks, or commentary.</span>
-                </li>
-                <li className="flex items-center gap-2">
-                  <span className="w-1.5 h-1.5 rounded-full bg-amber-500"></span>
-                  <span><strong>Detected verse schema:</strong> Includes <code className="font-mono bg-slate-100 dark:bg-slate-800 px-1 py-0.5 rounded">detected: true</code>, <code className="font-mono bg-slate-100 dark:bg-slate-800 px-1 py-0.5 rounded">book</code>, <code className="font-mono bg-slate-100 dark:bg-slate-800 px-1 py-0.5 rounded">chapter</code>, <code className="font-mono bg-slate-100 dark:bg-slate-800 px-1 py-0.5 rounded">verse_start</code>, <code className="font-mono bg-slate-100 dark:bg-slate-800 px-1 py-0.5 rounded">verse_end</code>, <code className="font-mono bg-slate-100 dark:bg-slate-800 px-1 py-0.5 rounded">confidence</code>, and <code className="font-mono bg-slate-100 dark:bg-slate-800 px-1 py-0.5 rounded">raw_spoken_phrase</code>.</span>
-                </li>
-                <li className="flex items-center gap-2">
-                  <span className="w-1.5 h-1.5 rounded-full bg-amber-500"></span>
-                  <span><strong>No verse detected schema:</strong> Returns strictly <code className="font-mono bg-slate-100 dark:bg-slate-800 px-1 py-0.5 rounded">{"{ \"detected\": false }"}</code>.</span>
-                </li>
-              </ul>
-            </div>
           </div>
         )}
 
       </main>
-
-      {/* Clean Footer */}
-      <footer className="border-t border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 py-6 transition-colors mt-auto">
-        <div className="max-w-7xl mx-auto px-4 text-center text-xs text-slate-500 dark:text-slate-400">
-          ScripturePulse Church Projection System & Speech Parser · Powered by Gemini AI
-        </div>
-      </footer>
 
     </div>
   );
