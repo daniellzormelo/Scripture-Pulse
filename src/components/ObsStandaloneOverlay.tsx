@@ -82,7 +82,9 @@ export const ObsStandaloneOverlay: React.FC = () => {
     };
   }, []);
 
-  return (
+    const verseText = feedData.text || feedData.fullText || feedData.content_text || "";
+
+    return (
     <div className={`w-screen h-screen flex flex-col justify-end p-8 font-sans select-none overflow-hidden ${
       bgMode === 'green' ? 'bg-[#00ff00]' : bgMode === 'blue' ? 'bg-[#0000ff]' : 'bg-transparent'
     }`}>
@@ -105,7 +107,7 @@ export const ObsStandaloneOverlay: React.FC = () => {
               </span>
             </div>
             <p className="text-xl md:text-2xl font-cinzel leading-relaxed text-slate-100 italic font-medium">
-              "{feedData.text}"
+              "{verseText}"
             </p>
           </div>
         ) : theme === 'glass-broadcast' ? (
@@ -120,7 +122,7 @@ export const ObsStandaloneOverlay: React.FC = () => {
                 <span className="text-xs font-mono text-slate-300">[{feedData.translation || 'NIV'}]</span>
               </div>
               <p className="text-xl md:text-2xl font-serif leading-relaxed text-slate-100 italic">
-                "{feedData.text}"
+                "{verseText}"
               </p>
             </div>
           </div>
@@ -131,7 +133,7 @@ export const ObsStandaloneOverlay: React.FC = () => {
               {feedData.reference} · {feedData.translation || 'NIV'}
             </div>
             <p className="text-2xl font-bold font-sans text-white leading-snug">
-              "{feedData.text}"
+              "{verseText}"
             </p>
           </div>
         ) : (
@@ -143,7 +145,7 @@ export const ObsStandaloneOverlay: React.FC = () => {
               </span>
             </div>
             <p className="text-xl font-sans leading-relaxed text-slate-200 font-medium">
-              "{feedData.text}"
+              "{verseText}"
             </p>
           </div>
         )}

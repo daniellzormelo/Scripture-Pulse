@@ -50,17 +50,24 @@ export default function App() {
 
     const passage = getBiblePassageText(data.book, data.chapter, data.verse_start, data.verse_end);
     setPassageForProjection(passage);
+    return passage;
+  };
+
+  // Automatically sync & broadcast passageForProjection whenever updated in the app
+  useEffect(() => {
+    if (!passageForProjection) return;
 
     const feedPayload = {
       detected: true,
-      book: data.book,
-      chapter: data.chapter,
-      verse_start: data.verse_start,
-      verse_end: data.verse_end,
-      reference: passage.reference,
-      translation: passage.translation,
-      text: passage.fullText,
-      raw_spoken_phrase: data.raw_spoken_phrase || text,
+      book: passageForProjection.book,
+      chapter: passageForProjection.chapter,
+      verse_start: passageForProjection.verse_start,
+      verse_end: passageForProjection.verse_end,
+      reference: passageForProjection.reference,
+      translation: passageForProjection.translation,
+      text: passageForProjection.fullText,
+      fullText: passageForProjection.fullText,
+      raw_spoken_phrase: `${passageForProjection.reference} (${passageForProjection.translation})`,
       timestamp: new Date().toISOString()
     };
 
@@ -78,9 +85,7 @@ export default function App() {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(feedPayload)
     }).catch(() => {});
-
-    return passage;
-  };
+  }, [passageForProjection]);
 
   // Main API Parsing Handler with Zero-Latency Instant Local Parsing
   const handleParseText = async (

@@ -136,7 +136,7 @@ app.post('/api/easyworship-feed', (req, res) => {
       verse_end: feed.verse_end || feed.verse_start || 16,
       reference: feed.reference,
       translation: feed.translation || "NIV",
-      text: feed.text || "",
+      text: feed.text || feed.fullText || feed.content_text || "",
       raw_spoken_phrase: feed.raw_spoken_phrase || "",
       timestamp: new Date().toISOString()
     };
