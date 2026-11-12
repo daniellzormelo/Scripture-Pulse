@@ -1,0 +1,8 @@
+{
+  "name": "ScripturePulse - Real-time Church Speech Parser",
+  "description": "Continuous speech parser for church projection systems. Detects Bible passages in preacher audio, resolves relative references, and outputs structured JSON with lower-third overlays.",
+  "requestFramePermissions": [
+    "microphone"
+  ],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
