@@ -15,24 +15,34 @@ export const SoftwareIntegrationsHub: React.FC<SoftwareIntegrationsHubProps> = (
 
   const handleSendTestSignal = async () => {
     try {
-      await fetch('/api/parse-speech', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ text: 'Turn with me to John chapter 3 verse 16' })
-      });
-
-      localStorage.setItem('active_verse_feed', JSON.stringify({
+      const feedPayload = {
         detected: true,
-        book: 'John',
-        chapter: 3,
-        verse_start: 16,
-        verse_end: 16,
-        reference: 'John 3:16',
-        translation: 'NIV',
-        text: 'For God so loved the world that he gave his one and only Son, that whoever believes in him shall not perish but have eternal life.',
+        book: currentPassage?.book || 'John',
+        chapter: currentPassage?.chapter || 3,
+        verse_start: currentPassage?.verse_start || 16,
+        verse_end: currentPassage?.verse_end || 16,
+        reference: currentPassage?.reference || 'John 3:16',
+        translation: currentPassage?.translation || 'NIV',
+        text: currentPassage?.fullText || 'For God so loved the world that he gave his one and only Son, that whoever believes in him shall not perish but have eternal life.',
+        fullText: currentPassage?.fullText || 'For God so loved the world that he gave his one and only Son, that whoever believes in him shall not perish but have eternal life.',
         raw_spoken_phrase: 'John chapter 3 verse 16',
         timestamp: new Date().toISOString()
-      }));
+      };
+
+      // 1. Post to live Express server feed for OBS & EasyWorship pollers
+      fetch('/api/easyworship-feed', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(feedPayload)
+      }).catch(() => {});
+
+      // 2. Direct localStorage update
+      try {
+        localStorage.setItem('active_verse_feed', JSON.stringify(feedPayload));
+      } catch (e) {}
+
+      // 3. Dispatch window event
+      window.dispatchEvent(new CustomEvent('scripture-updated', { detail: feedPayload }));
 
       setSignalSent(true);
       setTimeout(() => setSignalSent(false), 2500);

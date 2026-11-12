@@ -38,14 +38,16 @@ const SYSTEM_INSTRUCTION = `You are a real-time speech parser for a church proje
   "detected": false
 }`;
 
+let quotaCooldownUntil = 0;
+
 export async function parseSpeechWithGemini(
   text: string,
   currentContext?: ActiveContext
 ): Promise<DetectionResponse> {
   const localResult = parseScriptureLocally(text, currentContext);
 
-  // If API Key is not set or empty, fallback gracefully to deterministic local regex parser
-  if (!process.env.GEMINI_API_KEY || process.env.GEMINI_API_KEY === "MY_GEMINI_API_KEY") {
+  // If API Key is not set or empty, or under quota cooldown, fallback gracefully to deterministic local regex parser
+  if (!process.env.GEMINI_API_KEY || process.env.GEMINI_API_KEY === "MY_GEMINI_API_KEY" || Date.now() < quotaCooldownUntil) {
     return localResult;
   }
 
@@ -91,8 +93,14 @@ export async function parseSpeechWithGemini(
     }
 
     return parsed;
-  } catch (error) {
-    console.warn("Gemini API call failed, using local parser fallback:", error);
+  } catch (error: any) {
+    const errorMsg = String(error?.message || error || "");
+    if (errorMsg.includes("429") || errorMsg.includes("RESOURCE_EXHAUSTED") || error?.status === 429) {
+      // Cooldown timer to avoid flooding server with 429 calls when quota is depleted
+      quotaCooldownUntil = Date.now() + 60000; // 1 minute cooldown
+    } else {
+      console.warn("Gemini API call failed, using local parser fallback:", errorMsg);
+    }
     return localResult;
   }
 }
